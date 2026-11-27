@@ -127,6 +127,33 @@ class SuppliersSink(ExactSink):
     name = "Suppliers"
     endpoint = "/crm/Accounts"
 
+    def get_payment_condition_code(self, description):
+        """Code of the Exact payment condition whose Description equals the given name"""
+        cache = self.__dict__.setdefault("_payment_condition_codes", {})
+        if description in cache:
+            return cache[description]
+        res = self.request_api(
+            "GET",
+            endpoint="/cashflow/PaymentConditions",
+            params={"$filter": f"Description eq '{self.escape_odata_string(description)}'", "$select": "Code,Description"},
+        )
+        res_json = xmltodict.parse(res.text)
+        entries = res_json.get("feed", {}).get("entry") or []
+        if isinstance(entries, dict):
+            entries = [entries]
+        code = None
+        if entries:
+            code = entries[0]["content"]["m:properties"].get("d:Code")
+            # xmltodict gives a dict when the element has attributes (m:type), else the plain text
+            if isinstance(code, dict):
+                code = code.get("#text")
+            if len(entries) > 1:
+                self.logger.warning(f"Several Exact payment conditions named '{description}', using code {code}")
+        else:
+            self.logger.warning(f"Exact payment condition '{description}' not found, PaymentConditionPurchase is not set")
+        cache[description] = code
+        return code
+
     def preprocess_record(self, record: dict, context: dict) -> dict:
         try:
             if record.get("division") and not self.current_division:
@@ -153,6 +180,10 @@ class SuppliersSink(ExactSink):
                 if id:
                     record["id"] = id
 
+            payment_term = record.get("paymentTerm")
+            if not payment_term and record.get("paymentTermName"):
+                payment_term = self.get_payment_condition_code(record["paymentTermName"])
+
             payload = {
                 "Name": record.get("vendorName"),
                 "Code": record.get("vendorCode"),
@@ -160,7 +191,7 @@ class SuppliersSink(ExactSink):
                 "IsSupplier": True,
                 "PurchaseCurrency": record.get("currency"),
                 "VATNumber": record.get("taxPayerNumber"),
-                "PaymentConditionPurchase": record.get("paymentTerm"),
+                "PaymentConditionPurchase": payment_term,
                 "Id": record.get("id")
             }
 
