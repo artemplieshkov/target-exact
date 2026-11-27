@@ -127,6 +127,33 @@ class SuppliersSink(ExactSink):
     name = "Suppliers"
     endpoint = "/crm/Accounts"
 
+    def get_payment_condition_code(self, description):
+        """Code of the Exact payment condition whose Description equals the given name"""
+        cache = self.__dict__.setdefault("_payment_condition_codes", {})
+        if description in cache:
+            return cache[description]
+        res = self.request_api(
+            "GET",
+            endpoint="/cashflow/PaymentConditions",
+            params={"$filter": f"Description eq '{self.escape_odata_string(description)}'", "$select": "Code,Description"},
+        )
+        res_json = xmltodict.parse(res.text)
+        entries = res_json.get("feed", {}).get("entry") or []
+        if isinstance(entries, dict):
+            entries = [entries]
+        code = None
+        if entries:
+            code = entries[0]["content"]["m:properties"].get("d:Code")
+            # xmltodict gives a dict when the element has attributes (m:type), else the plain text
+            if isinstance(code, dict):
+                code = code.get("#text")
+            if len(entries) > 1:
+                self.logger.warning(f"Several Exact payment conditions named '{description}', using code {code}")
+        else:
+            self.logger.warning(f"Exact payment condition '{description}' not found, PaymentConditionPurchase is not set")
+        cache[description] = code
+        return code
+
     def preprocess_record(self, record: dict, context: dict) -> dict:
         try:
             if record.get("division") and not self.current_division:
@@ -146,11 +173,16 @@ class SuppliersSink(ExactSink):
             if not record.get("id"):
                 id = None
                 if record.get("vendorCode"):
-                    id = self.get_id("/crm/Accounts", {"$filter": f"Code eq '{record.get('vendorCode')}'"})
+                    code = self.escape_odata_string(str(record.get("vendorCode")).strip())
+                    id = self.get_id("/crm/Accounts", {"$filter": f"Code eq '{code.rjust(18)}' or Code eq '{code}'"})
                 if not id and record.get("vendorName"):
                     id = self.get_id("/crm/Accounts", {"$filter": f"Name eq '{self.escape_odata_string(record.get('vendorName'))}'"})
                 if id:
                     record["id"] = id
+
+            payment_term = record.get("paymentTerm")
+            if not payment_term and record.get("paymentTermName"):
+                payment_term = self.get_payment_condition_code(record["paymentTermName"])
 
             payload = {
                 "Name": record.get("vendorName"),
@@ -159,11 +191,13 @@ class SuppliersSink(ExactSink):
                 "IsSupplier": True,
                 "PurchaseCurrency": record.get("currency"),
                 "VATNumber": record.get("taxPayerNumber"),
-                "PaymentConditionPurchase": record.get("paymentTerm"),
+                "PaymentConditionPurchase": payment_term,
                 "Id": record.get("id")
             }
 
             bankAccounts = record.get("bankAccounts")
+            if bankAccounts and isinstance(bankAccounts, str):
+                bankAccounts = self.parse_objs(bankAccounts)
             if bankAccounts:
                 payload["bankAccounts"] = bankAccounts
 
@@ -181,6 +215,7 @@ class SuppliersSink(ExactSink):
                     record_address = record_address[0]
                     payload["AddressLine1"] = record_address.get("line1")
                     payload["City"] = record_address.get("city")
+                    payload["Postcode"] = record_address.get("postalCode")
                     payload["State"] = record_address.get("state")
 
                     country = record_address.get("country")
@@ -216,28 +251,30 @@ class SuppliersSink(ExactSink):
             response = self.request_api(
                 method, endpoint=endpoint, request_data=record
             )
-            # send bank account data if exists
-            if bankAccounts:
-                for bankAccount in bankAccounts: # how not to send dupplicated bank accounts
-                    bank_account = bankAccount.get("accountNumber")
-                    # check if bankAccount already exists
-                    bank_accounts_endpoint = f"/crm/BankAccounts?$filter=BankAccount eq '{self.escape_odata_string(bank_account)}' and Account eq '{id}'"
-                    bank_acct = self.request_api("GET", endpoint=bank_accounts_endpoint)
-
-                    if not bank_acct:
-                        ba_payload = {
-                            "BankAccount": bankAccount.get("accountNumber"),
-                            "BankAccountHolderName": bankAccount.get("holderName"),
-                            "BICCode": bankAccount.get("swiftCode")
-                        }
-                        bank_acct_response = self.request_api(
-                            "POST", endpoint="/crm/BankAccounts", request_data=ba_payload
-                        )
-            # get new id if it's a new supplier else use id used for update
             if response.status_code == 201:
                 res_json = xmltodict.parse(response.text)
                 id = res_json["entry"]["content"]["m:properties"]["d:ID"]["#text"]
                 self.logger.info(f"{self.name} {action} with id: {id}")
+            if bankAccounts and id:
+                for bankAccount in bankAccounts:
+                    bank_account = bankAccount.get("accountNumber")
+                    if not bank_account:
+                        continue
+                    bank_acct_id = self.get_id(
+                        "/crm/BankAccounts",
+                        {"$filter": f"BankAccount eq '{self.escape_odata_string(bank_account)}' and Account eq guid'{id}'"},
+                    )
+                    if not bank_acct_id:
+                        ba_payload = {
+                            "Account": id,
+                            "BankAccount": bank_account,
+                            "BankAccountHolderName": bankAccount.get("holderName"),
+                            "BICCode": bankAccount.get("swiftCode")
+                        }
+                        ba_payload = {k: v for k, v in ba_payload.items() if v is not None}
+                        self.request_api(
+                            "POST", endpoint="/crm/BankAccounts", request_data=ba_payload
+                        )
             return id, True, state_updates
 
 
